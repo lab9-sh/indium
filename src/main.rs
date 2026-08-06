@@ -10,7 +10,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
-use hydrogen::{AnthropicConfig, Client, ToolChoice};
+use hydrogen::{AnthropicConfig, Client, ToolChoice, XaiConfig};
 use indium::agent::Agent;
 use indium::goban::{Color, Game, Move, Point};
 use indium::record::Recorder;
@@ -22,9 +22,12 @@ USAGE:
     indium [OPTIONS]
 
 OPTIONS:
+    --provider <NAME>        anthropic | xai. Default: anthropic.
     --opponent <human|bot>   Who plays Black. Default: human.
     --moves <N>              Stop after N total moves. Default: 0 (unlimited).
-    --model <ID>             Default: claude-opus-5.
+    --model <ID>             Default depends on --provider:
+                             anthropic → claude-opus-5
+                             xai       → grok-4.5
     --tool-choice <MODE>     auto | required | forced. Default: auto.
                              NOTE: required/forced suppress the model's
                              reasoning entirely — see README.
@@ -38,12 +41,55 @@ OPTIONS:
     --out <DIR>              Where to write game.sgf and prompts.log.
                              Default: ./games/latest.
     -h, --help               Show this help.
+
+ENV:
+    ANTHROPIC_API_KEY        Required for --provider anthropic (or ./.env).
+    XAI_API_KEY              Required for --provider xai (or ./.env).
 ";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    Anthropic,
+    Xai,
+}
+
+impl Provider {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "anthropic" => Ok(Self::Anthropic),
+            "xai" => Ok(Self::Xai),
+            other => Err(format!("unknown --provider '{other}' (want anthropic|xai)")),
+        }
+    }
+
+    fn default_model(self) -> &'static str {
+        match self {
+            Self::Anthropic => "claude-opus-5",
+            Self::Xai => "grok-4.5",
+        }
+    }
+
+    fn env_key(self) -> &'static str {
+        match self {
+            Self::Anthropic => "ANTHROPIC_API_KEY",
+            Self::Xai => "XAI_API_KEY",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Xai => "xai",
+        }
+    }
+}
+
 struct Opts {
+    provider: Provider,
     bot: bool,
     moves: u32,
-    model: String,
+    /// `None` until `--model` is set; resolved against provider default later.
+    model: Option<String>,
     tool_choice: ToolChoice,
     collapse_retries: bool,
     max_attempts: usize,
@@ -55,9 +101,10 @@ struct Opts {
 impl Default for Opts {
     fn default() -> Self {
         Self {
+            provider: Provider::Anthropic,
             bot: false,
             moves: 0,
-            model: "claude-opus-5".into(),
+            model: None,
             tool_choice: ToolChoice::Auto,
             collapse_retries: false,
             max_attempts: 3,
@@ -65,6 +112,14 @@ impl Default for Opts {
             out: "games/latest".into(),
             keep_reasoning: usize::MAX,
         }
+    }
+}
+
+impl Opts {
+    fn model(&self) -> String {
+        self.model
+            .clone()
+            .unwrap_or_else(|| self.provider.default_model().into())
     }
 }
 
@@ -77,9 +132,10 @@ fn parse_args() -> Result<Option<Opts>, String> {
         };
         match a.as_str() {
             "-h" | "--help" => return Ok(None),
+            "--provider" => o.provider = Provider::parse(&next("--provider")?)?,
             "--opponent" => o.bot = matches!(next("--opponent")?.as_str(), "bot"),
             "--moves" => o.moves = next("--moves")?.parse().map_err(|e| format!("{e}"))?,
-            "--model" => o.model = next("--model")?,
+            "--model" => o.model = Some(next("--model")?),
             "--max-attempts" => {
                 o.max_attempts = next("--max-attempts")?.parse().map_err(|e| format!("{e}"))?
             }
@@ -139,8 +195,9 @@ async fn main() -> ExitCode {
     };
 
     load_env();
-    let Ok(key) = env::var("ANTHROPIC_API_KEY") else {
-        eprintln!("error: ANTHROPIC_API_KEY is not set (checked env and ./.env)");
+    let key_name = opts.provider.env_key();
+    let Ok(key) = env::var(key_name) else {
+        eprintln!("error: {key_name} is not set (checked env and ./.env)");
         return ExitCode::FAILURE;
     };
 
@@ -153,12 +210,20 @@ async fn main() -> ExitCode {
     }
 }
 
+fn build_client(provider: Provider, key: String) -> Client {
+    match provider {
+        Provider::Anthropic => Client::anthropic(AnthropicConfig::new(key)),
+        Provider::Xai => Client::xai(XaiConfig::new(key)),
+    }
+}
+
 async fn run(opts: Opts, key: String) -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::anthropic(AnthropicConfig::new(key));
+    let model = opts.model();
+    let client = build_client(opts.provider, key);
     // The model plays White, so the human (or bot) opens as Black.
     let mut agent = Agent::new(
         client,
-        opts.model.clone(),
+        model.clone(),
         Color::White,
         opts.tool_choice.clone(),
         opts.max_attempts,
@@ -169,7 +234,11 @@ async fn run(opts: Opts, key: String) -> Result<(), Box<dyn std::error::Error>> 
     let mut rec = Recorder::new(&opts.out)?;
     let mut rng = Rng::new(opts.seed);
 
-    println!("indium — you are Black (X), {} is White (O)", opts.model);
+    println!(
+        "indium — you are Black (X), {} ({}) is White (O)",
+        model,
+        opts.provider.name()
+    );
     println!("commands: a coordinate like Q16, or 'pass', 'resign', 'quit'\n");
 
     while !game.is_over() {
@@ -263,7 +332,7 @@ async fn run(opts: Opts, key: String) -> Result<(), Box<dyn std::error::Error>> 
     println!("\n{}\n", game.render_board());
     report(&game, &agent, &opts);
 
-    let sgf = rec.write_sgf(game.history(), "Human", &opts.model)?;
+    let sgf = rec.write_sgf(game.history(), "Human", &model)?;
     println!("\nsgf:     {}", sgf.display());
     println!("prompts: {}", rec.dir().join("prompts.log").display());
     Ok(())
@@ -281,6 +350,8 @@ fn report(game: &Game, agent: &Agent, opts: &Opts) {
     println!("provisional area score (no dead-stone removal): Black {b}, White {w}");
 
     println!("\n=== loop telemetry ===");
+    println!("provider:           {}", opts.provider.name());
+    println!("model:              {}", opts.model());
     println!("model moves:        {}", s.total_moves());
     println!("api calls:          {}", s.total_api_calls());
     println!(
@@ -335,6 +406,17 @@ fn report(game: &Game, agent: &Agent, opts: &Opts) {
             "prompt cache served {cache_read}/{billed} input tokens ({:.0}%)",
             cache_read as f64 / billed as f64 * 100.0
         );
+    }
+    match opts.provider {
+        Provider::Anthropic => {
+            println!("cache: Anthropic explicit breakpoints (cache_breakpoint_from_end=1)");
+        }
+        Provider::Xai => {
+            println!(
+                "cache: xAI automatic prefix caching (prompt_cache_key); \
+                 demotion edits earlier messages so hit rate is lower than pure-append"
+            );
+        }
     }
     if matches!(opts.tool_choice, ToolChoice::Auto) {
         println!("tool_choice=auto: model reasoning preserved");

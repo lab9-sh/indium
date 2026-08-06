@@ -6,14 +6,16 @@ under a real long-running environment loop, and it is a POC — the loop and the
 telemetry are the deliverable, not the playing strength.
 
 ```bash
-cargo run --release -- --opponent human          # play a game
-cargo run --release -- --opponent bot --moves 30 # headless, prints telemetry
+cargo run --release -- --opponent human          # play a game (Anthropic default)
+cargo run --release -- --provider xai --opponent bot --moves 30
 cargo run --release -- --help
 ```
 
-Needs `ANTHROPIC_API_KEY` in the environment or `./.env`. Each run writes
-`game.sgf` and `prompts.log` (the exact fat block sent each turn, next to what
-came back) to `--out`, default `games/latest`.
+`--provider` selects the backend (`anthropic` default, or `xai`). Keys come from
+the environment or `./.env`: `ANTHROPIC_API_KEY` / `XAI_API_KEY`. Default models
+are `claude-opus-5` and `grok-4.5` respectively (`--model` overrides). Each run
+writes `game.sgf` and `prompts.log` (the exact fat block sent each turn, next to
+what came back) to `--out`, default `games/latest`.
 
 ## What is being validated
 
