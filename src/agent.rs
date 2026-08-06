@@ -14,7 +14,8 @@
 
 use hydrogen::types::{ContentBlock, Message, Role, TextBlock, ToolResultBlock, ToolUseBlock};
 use hydrogen::{
-    Client, Conversation, Error, RequestOptions, ToolChoice, ToolDef, ToolOutput, Usage,
+    Client, Conversation, Error, RequestOptions, ThinkingEffort, ToolChoice, ToolDef, ToolOutput,
+    Usage,
 };
 use serde_json::json;
 
@@ -114,7 +115,7 @@ impl Agent {
         client: Client,
         model: String,
         color: Color,
-        tool_choice: ToolChoice,
+        thinking: ThinkingEffort,
         max_attempts: usize,
         collapse_retries: bool,
         keep_reasoning: usize,
@@ -123,7 +124,10 @@ impl Agent {
             model,
             system: Some(crate::prompt::SYSTEM_PROMPT.into()),
             tools: vec![play_move_tool(), update_notes_tool()],
-            tool_choice,
+            // Auto keeps reasoning; forced/required suppress it (see README
+            // finding 1). Both providers call tools reliably under auto.
+            tool_choice: ToolChoice::Auto,
+            thinking: Some(thinking),
             // One move per turn: without this the model can emit play_move and
             // update_notes together and the loop has to guess their order.
             parallel_tool_calls: Some(false),

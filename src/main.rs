@@ -10,7 +10,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
-use hydrogen::{AnthropicConfig, Client, ToolChoice, XaiConfig};
+use hydrogen::{AnthropicConfig, Client, ThinkingEffort, XaiConfig};
 use indium::agent::Agent;
 use indium::goban::{Color, Game, Move, Point};
 use indium::record::Recorder;
@@ -28,9 +28,8 @@ OPTIONS:
     --model <ID>             Default depends on --provider:
                              anthropic → claude-opus-5
                              xai       → grok-4.5
-    --tool-choice <MODE>     auto | required | forced. Default: auto.
-                             NOTE: required/forced suppress the model's
-                             reasoning entirely — see README.
+    --thinking <LEVEL>       high | medium | low. Default: medium.
+                             Reasoning budget (hydrogen ThinkingEffort).
     --collapse-retries       Drop assistant/tool_result pairs left by rejected
                              moves instead of keeping them.
     --max-attempts <N>       Illegal-move retries before forcing a pass. Default: 3.
@@ -90,7 +89,7 @@ struct Opts {
     moves: u32,
     /// `None` until `--model` is set; resolved against provider default later.
     model: Option<String>,
-    tool_choice: ToolChoice,
+    thinking: ThinkingEffort,
     collapse_retries: bool,
     max_attempts: usize,
     seed: u64,
@@ -105,7 +104,7 @@ impl Default for Opts {
             bot: false,
             moves: 0,
             model: None,
-            tool_choice: ToolChoice::Auto,
+            thinking: ThinkingEffort::Medium,
             collapse_retries: false,
             max_attempts: 3,
             seed: 1,
@@ -147,12 +146,16 @@ fn parse_args() -> Result<Option<Opts>, String> {
             }
             "--out" => o.out = next("--out")?,
             "--collapse-retries" => o.collapse_retries = true,
-            "--tool-choice" => {
-                o.tool_choice = match next("--tool-choice")?.as_str() {
-                    "auto" => ToolChoice::Auto,
-                    "required" => ToolChoice::Required,
-                    "forced" => ToolChoice::Tool("play_move".into()),
-                    other => return Err(format!("unknown --tool-choice '{other}'")),
+            "--thinking" => {
+                o.thinking = match next("--thinking")?.as_str() {
+                    "high" => ThinkingEffort::High,
+                    "medium" => ThinkingEffort::Medium,
+                    "low" => ThinkingEffort::Low,
+                    other => {
+                        return Err(format!(
+                            "unknown --thinking '{other}' (want high|medium|low)"
+                        ));
+                    }
                 }
             }
             other => return Err(format!("unknown argument '{other}'")),
@@ -225,7 +228,7 @@ async fn run(opts: Opts, key: String) -> Result<(), Box<dyn std::error::Error>> 
         client,
         model.clone(),
         Color::White,
-        opts.tool_choice.clone(),
+        opts.thinking,
         opts.max_attempts,
         opts.collapse_retries,
         opts.keep_reasoning,
@@ -352,6 +355,14 @@ fn report(game: &Game, agent: &Agent, opts: &Opts) {
     println!("\n=== loop telemetry ===");
     println!("provider:           {}", opts.provider.name());
     println!("model:              {}", opts.model());
+    println!(
+        "thinking:           {}",
+        match opts.thinking {
+            ThinkingEffort::High => "high",
+            ThinkingEffort::Medium => "medium",
+            ThinkingEffort::Low => "low",
+        }
+    );
     println!("model moves:        {}", s.total_moves());
     println!("api calls:          {}", s.total_api_calls());
     println!(
@@ -417,11 +428,6 @@ fn report(game: &Game, agent: &Agent, opts: &Opts) {
                  demotion edits earlier messages so hit rate is lower than pure-append"
             );
         }
-    }
-    if matches!(opts.tool_choice, ToolChoice::Auto) {
-        println!("tool_choice=auto: model reasoning preserved");
-    } else {
-        println!("tool_choice != auto: reasoning is suppressed by the API (see README)");
     }
 }
 

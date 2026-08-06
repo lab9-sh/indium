@@ -23,7 +23,8 @@ what came back) to `--out`, default `games/latest`.
 |---|---|
 | `messages_mut` / `push_message` / `from_parts` | works; the tail-state-block pattern is implementable |
 | `TextBlock::new` / `ToolResultBlock::new` | works |
-| `ToolChoice` | works on the wire, but see finding 1 |
+| `ToolChoice` | works on the wire, but see finding 1; indium hardcodes `Auto` |
+| `ThinkingEffort` | works; exposed as `--thinking high\|medium\|low` (default medium) |
 | `parallel_tool_calls: Some(false)` | works — 0 parallel calls observed in 32 API calls |
 | `cache_breakpoint_from_end` (added) | required; without it the pattern has *negative* cache value |
 
@@ -51,8 +52,10 @@ all reasoning to buy a guarantee you do not need: across 32 live API calls under
 also makes `update_notes` unreachable, since a pinned `tool_choice` can only
 ever select the one tool.
 
-`--tool-choice auto` is the default here for that reason. Keep `ToolChoice` in
-hydrogen — it is correct and useful — but the game should not use it for move
+Indium therefore hardcodes `ToolChoice::Auto` (the CLI flag was dropped once
+both providers proved reliable under auto: Anthropic 0/32 no-tool-call turns;
+xAI smoke games likewise always called `play_move`). Keep `ToolChoice` in
+hydrogen — it is correct and useful — but the game should not pin tools on move
 turns, and the proposal's example should not recommend it.
 
 ### 2. Demotion destroys the prompt cache
