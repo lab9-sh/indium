@@ -1,0 +1,20 @@
+[package]
+name = "indium"
+version = "0.1.0"
+edition = "2024"
+description = "Human-vs-LLM Go on a 19x19 board; a POC for hydrogen's agent-loop support"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "indium"
+path = "src/lib.rs"
+
+[[bin]]
+name = "indium"
+path = "src/main.rs"
+
+[dependencies]
+hydrogen = { path = "../hydrogen" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
