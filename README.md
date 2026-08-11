@@ -99,34 +99,13 @@ turn; real ones with reasoning ran 80–1284 output tokens.
 Demotion only ever controlled the user half of the transcript. The assistant
 half grows unbounded, and with thinking enabled it is the larger term.
 
-Mitigation, implemented here as `--keep-reasoning N`: drop `ReasoningBlock`s
-from all but the N most recent assistant turns. Anthropic only needs thinking
-preserved on the turn being continued, and stripping older ones is **accepted by
-the API** (verified over a full 30-move run, 16/16 calls, 10 blocks stripped):
-
-| run | growth/move | context at move 30 |
-|---|---|---|
-| `--keep-reasoning` unset (keep all) | 427 tok | 7552 |
-| `--keep-reasoning 1` | 153 tok | 3718 |
-
-This needs no new hydrogen API — `messages_mut` is already sufficient.
-
-**But do not use it together with the cache breakpoint.** Measured, they are
-substitutes rather than complements, and caching wins. Stripping rewrites the
-assistant turn that just aged out of the window, which sits at or before the
-breakpoint, so the cached prefix can never stabilize:
-
-| run (30 moves) | `cache_rd` at move 30 | uncached/turn | cache served |
-|---|---|---|---|
-| breakpoint only | 4332, growing | flat ~900–1300 | 65% |
-| breakpoint + `--keep-reasoning 1` | **frozen at 1479 from move 12** | grows 975 → 2419 | 47% |
-
-Stripping does produce a smaller raw transcript (3898 vs 5592 total input at
-move 30), but the wrong half of it is billed at full price. Costing cached
-tokens at ~0.1x, move 30 is ~1693 effective tokens with the breakpoint alone
-versus ~2567 with both. Keep the reasoning and let the cache absorb it; reach
-for `--keep-reasoning` only if raw context length, not cost, is the binding
-constraint.
+A prior experiment (`--keep-reasoning N`) dropped old `ReasoningBlock`s via
+transcript rewrite. It cut raw growth (427 → 153 tok/move) but **froze the
+prompt cache** when combined with breakpoints, because the strip rewrote
+history under the cache write point. Effective cost was worse with strip+cache
+than with cache alone. That flag is **removed**: prefer caching over strip
+when cost is the binding constraint. Raw-context truncation needs a separate
+hydrogen design if it returns.
 
 ### 3. The proposal's example code orphans a tool result
 
@@ -209,6 +188,6 @@ and the I-skip coordinate tests exist).
 - **The bot opponent is a heuristic**, not a Go player: it prefers contact moves
   so that fights actually happen and the atari/liberty half of the fat block
   gets exercised. It is a loop driver, not a sparring partner.
-- `--collapse-retries` (dropping the assistant/tool_result pairs left by
-  rejected moves) is implemented but **untested against a live rejection**,
-  because no run produced one.
+- **No retry collapse or reasoning strip** — both rewrote mid-transcript
+  history and are out of scope until hydrogen has a deliberate API for them.
+  Illegal-move retries keep their assistant/tool_result pairs in the log.

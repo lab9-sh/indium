@@ -50,7 +50,6 @@ pub struct Stats {
     pub no_tool_call: usize,
     pub forced_passes: usize,
     pub notes_updates: usize,
-    pub reasoning_stripped: usize,
 }
 
 impl Stats {
@@ -101,10 +100,6 @@ pub struct Agent {
     /// Move number the outstanding fat block asked about, for its stub.
     pending_stub_for: Option<u32>,
     max_attempts: usize,
-    collapse_retries: bool,
-    /// How many of the most recent assistant turns keep their reasoning
-    /// blocks. `usize::MAX` keeps all of them (the safe default).
-    keep_reasoning: usize,
     pub stats: Stats,
 }
 
@@ -115,8 +110,6 @@ impl Agent {
         color: Color,
         thinking: ThinkingEffort,
         max_attempts: usize,
-        collapse_retries: bool,
-        keep_reasoning: usize,
     ) -> Self {
         let opts = RequestOptions {
             model,
@@ -139,46 +132,8 @@ impl Agent {
             pending_tool_id: None,
             pending_stub_for: None,
             max_attempts,
-            collapse_retries,
-            keep_reasoning,
             stats: Stats::default(),
         }
-    }
-
-    /// Drop reasoning blocks from all but the most recent assistant turns.
-    ///
-    /// Demotion only controls the *user* side of the transcript. Assistant
-    /// turns accumulate forever, and with reasoning on they are the dominant
-    /// growth term — larger than the fat blocks the pattern was built to
-    /// remove. Anthropic only needs thinking preserved on the turn being
-    /// continued, so older ones can go.
-    fn strip_old_reasoning(&mut self) {
-        if self.keep_reasoning == usize::MAX {
-            return;
-        }
-        let keep = self.keep_reasoning;
-        let mut stripped = 0;
-        let msgs = self.conv.messages_mut();
-        let assistants: Vec<usize> = msgs
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.role == Role::Assistant)
-            .map(|(i, _)| i)
-            .collect();
-        let cutoff = assistants.len().saturating_sub(keep);
-        for &i in &assistants[..cutoff] {
-            let msg = &mut msgs[i];
-            let before = msg.content.len();
-            msg.content
-                .retain(|b| !matches!(b, ContentBlock::Reasoning(_)));
-            stripped += before - msg.content.len();
-            // A message with no content at all is not a valid turn.
-            if msg.content.is_empty() {
-                msg.content
-                    .push(ContentBlock::Text(TextBlock::new("(thinking omitted)")));
-            }
-        }
-        self.stats.reasoning_stripped += stripped;
     }
 
     pub fn message_count(&self) -> usize {
@@ -198,13 +153,11 @@ impl Agent {
     pub async fn take_turn(&mut self, game: &Game) -> Result<(TurnOutcome, String), Error> {
         let fat = fat_state_block(game, self.color, &self.notes);
         self.deliver_state(game, fat.clone());
-        self.strip_old_reasoning();
 
         let mut stat = TurnStat {
             move_number: game.move_number(),
             ..Default::default()
         };
-        let move_start = self.conv.messages().len();
         let mut commentary = String::new();
         let mut reasoning = String::new();
 
@@ -296,9 +249,6 @@ impl Agent {
             }
 
             if let Some((mv, rationale)) = accepted {
-                if self.collapse_retries {
-                    self.collapse(move_start);
-                }
                 stat.messages = self.conv.messages().len();
                 let attempts = stat.api_calls;
                 self.stats.turns.push(stat);
@@ -361,22 +311,6 @@ impl Agent {
             .unwrap_or(Move::Pass);
         let reply = hist.iter().find(|r| r.number == number + 1).map(|r| r.mv);
         thin_stub(number, own, reply)
-    }
-
-    /// Drop the assistant/tool_result pairs left behind by rejected attempts.
-    ///
-    /// Keeps the last assistant turn and any tool results already pushed for
-    /// it (e.g. a sibling `update_notes` answered in the same response). Each
-    /// removed pair is self-contained, so the transcript stays consistent —
-    /// but discarded thinking blocks are why this is opt-in.
-    fn collapse(&mut self, move_start: usize) {
-        let msgs = self.conv.messages();
-        let Some(assistant_idx) = msgs.iter().rposition(|m| m.role == Role::Assistant) else {
-            return;
-        };
-        if assistant_idx > move_start {
-            self.conv.messages_mut().drain(move_start..assistant_idx);
-        }
     }
 
     /// The environment is authoritative. Validation never mutates the game.

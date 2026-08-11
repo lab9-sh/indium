@@ -30,12 +30,7 @@ OPTIONS:
                              xai       → grok-4.5
     --thinking <LEVEL>       high | medium | low. Default: medium.
                              Reasoning budget (hydrogen ThinkingEffort).
-    --collapse-retries       Drop assistant/tool_result pairs left by rejected
-                             moves instead of keeping them.
     --max-attempts <N>       Illegal-move retries before forcing a pass. Default: 3.
-    --keep-reasoning <N>     Keep reasoning blocks on only the N most recent
-                             assistant turns. Default: all. Retained reasoning
-                             is the dominant context-growth term.
     --seed <N>               Bot opponent seed. Default: 1.
     --out <DIR>              Where to write game.sgf and prompts.log.
                              Default: ./games/latest.
@@ -90,11 +85,9 @@ struct Opts {
     /// `None` until `--model` is set; resolved against provider default later.
     model: Option<String>,
     thinking: ThinkingEffort,
-    collapse_retries: bool,
     max_attempts: usize,
     seed: u64,
     out: String,
-    keep_reasoning: usize,
 }
 
 impl Default for Opts {
@@ -105,11 +98,9 @@ impl Default for Opts {
             moves: 0,
             model: None,
             thinking: ThinkingEffort::Medium,
-            collapse_retries: false,
             max_attempts: 3,
             seed: 1,
             out: "games/latest".into(),
-            keep_reasoning: usize::MAX,
         }
     }
 }
@@ -139,13 +130,7 @@ fn parse_args() -> Result<Option<Opts>, String> {
                 o.max_attempts = next("--max-attempts")?.parse().map_err(|e| format!("{e}"))?
             }
             "--seed" => o.seed = next("--seed")?.parse().map_err(|e| format!("{e}"))?,
-            "--keep-reasoning" => {
-                o.keep_reasoning = next("--keep-reasoning")?
-                    .parse()
-                    .map_err(|e| format!("{e}"))?
-            }
             "--out" => o.out = next("--out")?,
-            "--collapse-retries" => o.collapse_retries = true,
             "--thinking" => {
                 o.thinking = match next("--thinking")?.as_str() {
                     "high" => ThinkingEffort::High,
@@ -230,8 +215,6 @@ async fn run(opts: Opts, key: String) -> Result<(), Box<dyn std::error::Error>> 
         Color::White,
         opts.thinking,
         opts.max_attempts,
-        opts.collapse_retries,
-        opts.keep_reasoning,
     );
     let mut game = Game::new();
     let mut rec = Recorder::new(&opts.out)?;
@@ -373,7 +356,6 @@ fn report(game: &Game, agent: &Agent, opts: &Opts) {
     println!("no-tool-call turns: {}", s.no_tool_call);
     println!("forced passes:      {}", s.forced_passes);
     println!("notes updates:      {}", s.notes_updates);
-    println!("reasoning stripped: {}", s.reasoning_stripped);
     println!("final messages:     {}", agent.message_count());
 
     if s.turns.is_empty() {

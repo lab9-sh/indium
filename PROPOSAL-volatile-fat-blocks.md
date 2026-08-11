@@ -1,6 +1,6 @@
 # Proposal: volatile fat blocks and automatic prompt caching
 
-Status: **proposed** (not implemented on `main`)
+Status: **accepted for implementation** — indium commits to **Shape B** (thin stable `play_move` ack + volatile user fat); hydrogen ships **user-only** volatile APIs first. See [PLAN-volatile-fat-blocks.md](./PLAN-volatile-fat-blocks.md).
 Motivating consumer: [indium](.) — human-vs-LLM Go (19×19, ~300 moves, one model turn per move)
 
 This document supersedes the earlier plan of shipping raw `messages_mut` plus an
@@ -16,10 +16,10 @@ The refined goal is narrower:
 2. **Prompt caching is hydrogen policy**, always on by default, with breakpoint
   placement derived from that mark so consumers never place `cache_control`.
 
-**Open consumer decision** (does not block the hydrogen concept): where the fat
-block lives in the transcript. Two viable loop shapes are documented in
-[§1b](#1b-two-consumer-loop-shapes). They share demotion + cache placement;
-they differ in whether a `tool_result` ever needs to be marked volatile.
+**Consumer decision (locked for indium):** Shape B — see [PLAN-volatile-fat-blocks.md](./PLAN-volatile-fat-blocks.md).
+Shape A remains documented in [§1b](#1b-two-consumer-loop-shapes) for a future
+consumer that needs fat-in-`tool_result`; hydrogen may still ship the full
+surface later, but indium does not require `*_volatile_tool_result` now.
 
 ---
 
