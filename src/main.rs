@@ -401,7 +401,9 @@ fn report(game: &Game, agent: &Agent, opts: &Opts) {
     }
     match opts.provider {
         Provider::Anthropic => {
-            println!("cache: Anthropic explicit breakpoints (cache_breakpoint_from_end=1)");
+            println!(
+                "cache: hydrogen automatic stable-prefix caching (volatile mark)"
+            );
         }
         Provider::Xai => {
             println!(

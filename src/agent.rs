@@ -1,18 +1,17 @@
-//! The tail-state-block agent loop.
+//! The tail-state-block agent loop (Shape B).
 //!
-//! Exactly one fat block exists in the transcript at any time, and it always
-//! sits at the end. Once the model has answered it, it is **demoted in place**
-//! to a one-line stub and a freshly rendered fat block is appended. Demotion
-//! replaces content and never removes a message, so the assistant turn above
-//! it is still answering something that exists.
+//! Exactly one **volatile fat** user message exists in the transcript at a
+//! time. After the model answers and the environment accepts a move, the next
+//! `deliver_state`:
 //!
-//! The fat block rides inside a `tool_result` whenever one is owed, which makes
-//! the whole game a single continuous tool loop. That is why demotion has to
-//! preserve the block *kind*: rewriting a `tool_result` into a plain text
-//! message would orphan the assistant's `tool_use` and Anthropic would reject
-//! the next request.
+//! 1. Answers the pending `play_move` with a thin **stable** `tool_result` ack.
+//! 2. Demotes the previous fat user turn to a one-line stub (via hydrogen's
+//!    volatile slot).
+//! 3. Appends a freshly rendered fat user block as the new volatile.
+//!
+//! Tool results are never rewritten. See `PLAN-volatile-fat-blocks.md`.
 
-use hydrogen::types::{ContentBlock, Message, Role, TextBlock, ToolResultBlock, ToolUseBlock};
+use hydrogen::types::{ContentBlock, ToolUseBlock};
 use hydrogen::{
     Client, Conversation, Error, RequestOptions, ThinkingEffort, ToolDef, ToolOutput, Usage,
 };
@@ -74,29 +73,27 @@ impl Stats {
 pub struct TurnOutcome {
     pub mv: Move,
     pub attempts: usize,
-    /// Assistant prose. Only appears on the first turn: once the fat block
-    /// rides in a `tool_result` the model continues the tool loop and emits
-    /// `[thinking, tool_use]` with no text block.
+    /// Assistant prose when the model emits a text block (often first turn).
     pub commentary: String,
-    /// Summarized thinking, which is where the reasoning actually lives for
-    /// every turn after the first.
+    /// Summarized thinking, which is where the reasoning often lives.
     pub reasoning: String,
     /// The `reasoning` argument of the `play_move` call itself.
     pub rationale: String,
     pub forced_pass: bool,
 }
 
+/// Shape B agent: thin stable `play_move` ack + volatile user fat board.
 pub struct Agent {
     client: Client,
     conv: Conversation,
     opts: RequestOptions,
     color: Color,
     notes: Notes,
-    /// Index of the message currently holding the fat block.
-    fat_carrier: Option<usize>,
-    /// A `play_move` call we deliberately left unanswered so the next fat
-    /// block can ride in its `tool_result`.
+    /// A `play_move` call accepted this turn; answered with a thin ack on the
+    /// next `deliver_state` (or `"game over"` on `finish`).
     pending_tool_id: Option<String>,
+    /// Ack text for that call, e.g. `ok: Q16` / `ok: pass`.
+    pending_ack: Option<String>,
     /// Move number the outstanding fat block asked about, for its stub.
     pending_stub_for: Option<u32>,
     max_attempts: usize,
@@ -117,9 +114,8 @@ impl Agent {
             tools: vec![play_move_tool(), update_notes_tool()],
             thinking: Some(thinking),
             max_tokens: Some(8192),
-            // The tail message is rebuilt every turn, so the breakpoint has to
-            // sit one back from it — on the last message that will not change.
-            cache_breakpoint_from_end: Some(1),
+            // Cache placement is hydrogen policy: Anthropic breakpoint is
+            // derived automatically from Conversation::volatile_index().
             ..Default::default()
         };
         Self {
@@ -128,8 +124,8 @@ impl Agent {
             opts,
             color,
             notes: Notes::default(),
-            fat_carrier: None,
             pending_tool_id: None,
+            pending_ack: None,
             pending_stub_for: None,
             max_attempts,
             stats: Stats::default(),
@@ -196,10 +192,9 @@ impl Agent {
                 continue;
             }
 
-            // Handle every tool_use so none are left unanswered. Notes get an
-            // immediate result; a successful play_move is left pending so the
-            // next fat block can ride in its tool_result. Both in one response
-            // is fine: notes apply to local state, then the move is returned.
+            // Handle every tool_use so none are left unanswered. Notes and
+            // illegal moves get immediate stable results; a successful
+            // play_move is left pending for a thin ack on the next deliver.
             let mut accepted: Option<(Move, String)> = None;
             for call in calls {
                 match call.name.as_str() {
@@ -223,6 +218,7 @@ impl Agent {
                         match self.validate(game, &call) {
                             Ok(mv) => {
                                 self.pending_tool_id = Some(call.id);
+                                self.pending_ack = Some(ack_text(mv));
                                 self.pending_stub_for = Some(game.move_number());
                                 let rationale = call
                                     .input
@@ -269,6 +265,7 @@ impl Agent {
         // Out of attempts. Pass rather than let a broken turn stall the game.
         self.stats.forced_passes += 1;
         self.pending_stub_for = Some(game.move_number());
+        // No pending tool_id if the model never produced a valid play_move.
         stat.messages = self.conv.messages().len();
         self.stats.turns.push(stat);
         Ok((
@@ -284,21 +281,28 @@ impl Agent {
         ))
     }
 
-    /// Demote the outstanding fat block, then append the new one.
+    /// Shape B deliver: thin stable ack first (if any), then rotate/push fat user.
     fn deliver_state(&mut self, game: &Game, fat: String) {
-        if let (Some(idx), Some(number)) = (self.fat_carrier, self.pending_stub_for) {
-            let stub = self.stub_text(game, number);
-            demote_in_place(self.conv.messages_mut(), idx, stub);
+        // Anthropic requires tool_use answered before more user content.
+        if let Some(id) = self.pending_tool_id.take() {
+            let ack = self
+                .pending_ack
+                .take()
+                .unwrap_or_else(|| "ok".into());
+            self.conv.push_tool_result(id, ToolOutput::Text(ack));
         }
 
-        match self.pending_tool_id.take() {
-            Some(id) => self.conv.push_tool_result(&id, ToolOutput::Text(fat)),
-            None => self.conv.push_message(Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text(TextBlock::new(fat))],
-            }),
+        match self.pending_stub_for.take() {
+            Some(number) => {
+                let stub = self.stub_text(game, number);
+                self.conv.rotate_volatile_user(stub, fat);
+            }
+            None => {
+                self.conv
+                    .push_volatile_user(fat)
+                    .expect("no prior volatile on first deliver");
+            }
         }
-        self.fat_carrier = Some(self.conv.messages().len() - 1);
     }
 
     /// "Move 47 — you played Q3. Opponent replied R4."
@@ -342,30 +346,25 @@ impl Agent {
         }
     }
 
-    /// Answer any outstanding tool call so the saved transcript is well-formed.
+    /// Answer any outstanding tool call and demote the final fat for a clean
+    /// saved transcript.
     pub fn finish(&mut self) {
         if let Some(id) = self.pending_tool_id.take() {
+            let _ = self.pending_ack.take();
             self.conv
                 .push_tool_result(&id, ToolOutput::Text("game over".into()));
+        }
+        if self.conv.volatile_index().is_some() {
+            let _ = self.conv.demote_volatile("game over");
         }
     }
 }
 
-/// Replace a fat block with its stub, in place, keeping the block kind.
-///
-/// A `tool_result` must stay a `tool_result`: rewriting it as plain text would
-/// leave the preceding assistant turn's `tool_use` unanswered, which Anthropic
-/// rejects. The message is never removed, so the turn above it still has
-/// something to answer.
-pub fn demote_in_place(msgs: &mut [Message], idx: usize, stub: String) {
-    let Some(msg) = msgs.get_mut(idx) else { return };
-    let demoted = match msg.content.first() {
-        Some(ContentBlock::ToolResult(tr)) => {
-            ContentBlock::ToolResult(ToolResultBlock::new(tr.id.clone(), ToolOutput::Text(stub)))
-        }
-        _ => ContentBlock::Text(TextBlock::new(stub)),
-    };
-    msg.content = vec![demoted];
+fn ack_text(mv: Move) -> String {
+    match mv {
+        Move::Pass => "ok: pass".into(),
+        Move::Play(p) => format!("ok: {p}"),
+    }
 }
 
 fn accumulate(stat: &mut TurnStat, u: &Usage) {
@@ -416,6 +415,8 @@ pub fn update_notes_tool() -> ToolDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hydrogen::types::Role;
+    use hydrogen::Response;
 
     /// The move schema is the first line of defence, so pin its shape: `I` must
     /// be excluded and rows must not reach 20.
@@ -435,82 +436,111 @@ mod tests {
         assert!(schema["properties"]["tactics"].is_object());
     }
 
-    fn user_text(t: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text(TextBlock::new(t))],
-        }
-    }
-
-    fn user_tool_result(id: &str, t: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult(ToolResultBlock::new(
-                id,
-                ToolOutput::Text(t.into()),
-            ))],
-        }
-    }
-
-    /// The failure this guards against is silent until the API rejects it:
-    /// demoting a tool_result into plain text orphans the assistant's tool_use.
-    #[test]
-    fn demotion_keeps_a_tool_result_a_tool_result_with_the_same_id() {
-        let mut msgs = vec![user_tool_result("toolu_42", "FAT board state …")];
-        demote_in_place(&mut msgs, 0, "Move 47 — you played Q3.".into());
-
-        assert_eq!(msgs.len(), 1, "demotion must never remove a message");
-        match &msgs[0].content[..] {
-            [ContentBlock::ToolResult(tr)] => {
-                assert_eq!(tr.id, "toolu_42", "tool_use id must survive");
-                assert_eq!(tr.output, ToolOutput::Text("Move 47 — you played Q3.".into()));
-            }
-            other => panic!("expected a tool_result, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn demotion_keeps_a_plain_user_turn_plain() {
-        let mut msgs = vec![user_text("FAT board state …")];
-        demote_in_place(&mut msgs, 0, "Move 1 — you played Q16.".into());
-        match &msgs[0].content[..] {
-            [ContentBlock::Text(t)] => assert_eq!(t.text, "Move 1 — you played Q16."),
-            other => panic!("expected text, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn demotion_of_a_missing_index_is_a_no_op() {
-        let mut msgs = vec![user_text("only message")];
-        demote_in_place(&mut msgs, 7, "stub".into());
-        assert_eq!(msgs.len(), 1);
-    }
-
-    /// Only the tail is ever fat: after demoting, no earlier message may still
-    /// carry a full board.
-    #[test]
-    fn only_one_fat_block_survives_a_demotion_cycle() {
-        let mut msgs = vec![
-            user_tool_result("t1", "FAT 1"),
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text(TextBlock::new("I play D4"))],
+    /// `Response.provider` is crate-private in hydrogen; build fixtures via serde.
+    fn assistant_response(text: &str) -> Response {
+        serde_json::from_value(serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": [{"kind": "text", "text": text}]
             },
-            user_tool_result("t2", "FAT 2"),
-        ];
-        demote_in_place(&mut msgs, 0, "Move 1 — you played Q16.".into());
-        let fat_count = msgs
-            .iter()
-            .filter(|m| {
-                m.content.iter().any(|b| match b {
-                    ContentBlock::ToolResult(tr) => {
-                        matches!(&tr.output, ToolOutput::Text(s) if s.starts_with("FAT"))
-                    }
-                    _ => false,
-                })
-            })
-            .count();
-        assert_eq!(fat_count, 1);
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "provider": "anthropic"
+        }))
+        .expect("fixture Response")
+    }
+
+    /// Shape B demotion is hydrogen's user-text path: content-only rewrite
+    /// under later assistant turns, never the assistant itself.
+    #[test]
+    fn volatile_user_demotion_is_content_only_under_assistant() {
+        let mut conv = Conversation::new();
+        conv.push_volatile_user("FAT board state …").unwrap();
+        conv.push_response(assistant_response("I play Q16"));
+        let len = conv.messages().len();
+
+        conv.demote_volatile("Move 1 — you played Q16.").unwrap();
+
+        assert_eq!(conv.messages().len(), len);
+        assert_eq!(conv.volatile_index(), None);
+        match &conv.messages()[0].content[..] {
+            [ContentBlock::Text(t)] => assert_eq!(t.text, "Move 1 — you played Q16."),
+            other => panic!("expected demoted text, got {other:?}"),
+        }
+        assert_eq!(conv.messages()[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn rotate_volatile_user_rewrites_marked_fat_and_appends_new() {
+        let mut conv = Conversation::new();
+        conv.push_volatile_user("FAT 1").unwrap();
+        conv.push_response(assistant_response("ok"));
+        conv.rotate_volatile_user("Move 1 — you played Q16.", "FAT 2");
+
+        assert_eq!(conv.messages().len(), 3);
+        assert_eq!(conv.volatile_index(), Some(2));
+        match &conv.messages()[0].content[..] {
+            [ContentBlock::Text(t)] => assert_eq!(t.text, "Move 1 — you played Q16."),
+            other => panic!("expected stub, got {other:?}"),
+        }
+        match &conv.messages()[2].content[..] {
+            [ContentBlock::Text(t)] => assert_eq!(t.text, "FAT 2"),
+            other => panic!("expected new fat, got {other:?}"),
+        }
+    }
+
+    /// deliver_state ordering: ack the pending play_move before rotating fat,
+    /// so Anthropic never sees a new user turn with an unanswered tool_use.
+    #[test]
+    fn deliver_state_ack_then_rotate_fat() {
+        // Simulate the Shape B bookkeeping without a live client.
+        let mut conv = Conversation::new();
+        conv.push_volatile_user("FAT 1").unwrap();
+        conv.push_response(assistant_response("tool would be here"));
+        // Environment accepted a move; pending thin ack + stub for move 1.
+        let mut pending_tool_id = Some("toolu_1".to_string());
+        let mut pending_ack = Some("ok: Q16".to_string());
+        let mut pending_stub_for = Some(1u32);
+
+        // --- deliver_state body ---
+        if let Some(id) = pending_tool_id.take() {
+            let ack = pending_ack.take().unwrap_or_else(|| "ok".into());
+            conv.push_tool_result(id, ToolOutput::Text(ack));
+        }
+        match pending_stub_for.take() {
+            Some(_) => conv.rotate_volatile_user("Move 1 — you played Q16.", "FAT 2"),
+            None => conv.push_volatile_user("FAT 2").unwrap(),
+        }
+
+        // Message order: thin user, assistant, stable ack tool_result, new fat.
+        assert_eq!(conv.messages().len(), 4);
+        assert_eq!(conv.messages()[0].role, Role::User);
+        assert_eq!(conv.messages()[1].role, Role::Assistant);
+        assert_eq!(conv.messages()[2].role, Role::User);
+        match &conv.messages()[2].content[..] {
+            [ContentBlock::ToolResult(tr)] => {
+                assert_eq!(tr.id, "toolu_1");
+                assert_eq!(tr.output, ToolOutput::Text("ok: Q16".into()));
+            }
+            other => panic!("expected stable ack tool_result, got {other:?}"),
+        }
+        assert_eq!(conv.volatile_index(), Some(3));
+        match &conv.messages()[3].content[..] {
+            [ContentBlock::Text(t)] => assert_eq!(t.text, "FAT 2"),
+            other => panic!("expected fat user, got {other:?}"),
+        }
+        // Demoted first fat is still user text (kind preserved as text).
+        match &conv.messages()[0].content[..] {
+            [ContentBlock::Text(t)] => assert_eq!(t.text, "Move 1 — you played Q16."),
+            other => panic!("expected demoted stub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ack_text_formats_play_and_pass() {
+        assert_eq!(ack_text(Move::Pass), "ok: pass");
+        let p = Point::parse("Q16").unwrap();
+        assert_eq!(ack_text(Move::Play(p)), "ok: Q16");
     }
 
     #[test]

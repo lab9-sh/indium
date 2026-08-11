@@ -19,17 +19,19 @@ what came back) to `--out`, default `games/latest`.
 
 ## What is being validated
 
-| Proposal feature | Status |
-|---|---|
-| `messages_mut` / `push_message` / `from_parts` | works; the tail-state-block pattern is implementable |
-| `TextBlock::new` / `ToolResultBlock::new` | works |
-| `ThinkingEffort` | works; exposed as `--thinking high\|medium\|low` (default medium) |
-| `cache_breakpoint_from_end` (added) | required; without it the pattern has *negative* cache value |
+Indium uses **Shape B** (thin stable `play_move` ack + volatile **user** fat
+board). See [PLAN-volatile-fat-blocks.md](PLAN-volatile-fat-blocks.md).
 
-The mutability surface does what it says. An explicit cache breakpoint
-(`cache_breakpoint_from_end`, finding 1) was also required and is now part of
-the hydrogen surface this POC needs. Several things surfaced that the proposal
-did not anticipate.
+| Feature | Status |
+|---|---|
+| `Conversation::push_volatile_user` / `rotate_volatile_user` / `demote_volatile` | used for the board tail |
+| Automatic Anthropic cache placement from `volatile_index` | hydrogen policy; no consumer cache knobs |
+| Stable thin `push_tool_result` ack per accepted move | Shape B; tool results never rewritten |
+| `ThinkingEffort` | works; exposed as `--thinking high\|medium\|low` (default medium) |
+
+Historical experiments briefly used free `messages_mut` and
+`cache_breakpoint_from_end`; those are **not** on the current path. Findings
+below remain useful as measurement history.
 
 ## Findings
 
@@ -65,19 +67,19 @@ carrier (it becomes a stub), so everything up to the message *before* the
 carrier is stable across the pair. Put the breakpoint there and reads return,
 writes collapse to ~31/turn, and the cached prefix grows monotonically.
 
-This needed a hydrogen change, since a single implicit top-level marker cannot
-express placement. Added as `RequestOptions::cache_breakpoint_from_end:
-Option<usize>` — additive, defaults to `None` (current behavior), and
-`Some(1)` expresses precisely the invariant this pattern relies on: *the tail
-is volatile, everything before it is not*. When set, the whole-prompt marker is
-dropped, since keeping both would cache the volatile tail too.
+This needed a hydrogen change: a single implicit top-level marker cannot
+express placement under demotion. The current design places the breakpoint
+automatically from the conversation's **volatile mark** (no public
+`RequestOptions` cache field). Consumers call `push_volatile_user` /
+`rotate_volatile_user`; Anthropic encoding is adapter-local.
 
-Live 30-move game, before and after:
+Live 30-move game, before and after (prior breakpoint experiment; same
+placement rule as today's volatile mark):
 
 | | cache served | `cache_rd` at move 30 | uncached/turn |
 |---|---|---|---|
 | top-level marker only | 1–6% | 0 | grows to 21k |
-| `cache_breakpoint_from_end: Some(1)` | **65%** | 4332, growing monotonically | **flat, ~900–1300** |
+| breakpoint before volatile tail | **65%** | 4332, growing monotonically | **flat, ~900–1300** |
 
 The uncached column is the one that matters, and it is now flat — which is the
 proposal's actual claim ("you reprocess ~1000 tokens per turn and hit cache on
