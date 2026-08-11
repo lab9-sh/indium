@@ -47,7 +47,10 @@ working — unlike front-truncation, which invalidates every cached token.
 | # | Feature | Priority | Blocking? |
 |---|---|---|---|
 | 1 | [Mutable / constructible transcripts](#1-mutable--constructible-transcripts) | high | yes — pattern is impossible without it |
-| 2 | [`tool_choice` and parallel-call control](#2-tool_choice-and-parallel-call-control) | high | no, but affects wire correctness |
+
+(Explicit cache-breakpoint placement is a second hydrogen need that fell out of
+live validation; see indium's README finding on demotion and caching. It is not
+restated here.)
 
 ---
 
@@ -212,115 +215,6 @@ worth keeping.
   transcript silently loses reasoning blocks, which is acceptable between turns but
   **not** mid-tool-loop: Anthropic rejects a tool result whose preceding assistant
   turn lost its thinking block. Demote message *content*; never drop messages.
-
----
-
-## 2. `tool_choice` and parallel-call control
-
-### Problem
-
-[`RequestOptions`](src/types/request.rs#L6) exposes `tools` but no way to require a
-call. Two consequences for a game loop:
-
-1. The model can answer a move request with prose instead of calling `play_move`,
-   which means falling back to scraping a coordinate out of free text.
-2. Nothing prevents two `play_move` calls in one turn. Every provider supports
-   disabling this; hydrogen has no field for it.
-
-All three backends already support both knobs, so this is purely a missing portable
-surface:
-
-| provider | forced call | disable parallel |
-|---|---|---|
-| Anthropic | `tool_choice: {"type": "tool", "name": …}` | `tool_choice.disable_parallel_tool_use` |
-| OpenAI (Responses) | `tool_choice: {"type": "function", "name": …}` | `parallel_tool_calls: false` |
-| xAI | OpenAI-compatible | OpenAI-compatible |
-
-### Proposed API
-
-```rust
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolChoice {
-    #[default]
-    Auto,           // model decides (current behavior)
-    Required,       // must call some tool
-    Tool(String),   // must call this specific tool
-    None,           // tools visible but not callable
-}
-
-pub struct RequestOptions {
-    // ...existing fields...
-    #[serde(default)]
-    pub tool_choice: ToolChoice,
-
-    /// `None` leaves the provider default untouched.
-    #[serde(default)]
-    pub parallel_tool_calls: Option<bool>,
-}
-```
-
-`parallel_tool_calls` is `Option<bool>` rather than `bool` deliberately:
-`RequestOptions` derives `Default`, and a bare `bool` would default to `false`,
-silently changing behavior for every existing caller. (The `web_search: bool` field
-gets away with `false` because off *is* the current behavior;
-[src/types/request.rs:17](src/types/request.rs#L17).)
-
-### Client example
-
-Two option sets over the same conversation — the move turn is forced, the
-reflection turn is not:
-
-```rust
-use hydrogen::types::{ToolChoice, ToolDef};
-
-fn play_move_tool() -> ToolDef {
-    ToolDef {
-        name: "play_move".into(),
-        description: "Place a stone. Columns A-T excluding I; rows 1-19.".into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "point":     { "type": "string", "pattern": "^[A-HJ-T](1[0-9]|[1-9])$" },
-                "reasoning": { "type": "string", "description": "One line: why here." }
-            },
-            "required": ["point"],
-            "additionalProperties": false
-        }),
-    }
-}
-
-// Move turn: the model MUST emit exactly one play_move call.
-let move_opts = RequestOptions {
-    model: "claude-sonnet-4-20250514".into(),
-    system: Some(GO_RULES_AND_CONVENTIONS.into()),
-    tools: vec![play_move_tool(), update_notes_tool()],
-    tool_choice: ToolChoice::Tool("play_move".into()),
-    parallel_tool_calls: Some(false),
-    thinking: Some(ThinkingEffort::High),
-    ..Default::default()
-};
-
-// End-of-game review: let it talk instead.
-let review_opts = RequestOptions {
-    tool_choice: ToolChoice::None,
-    ..move_opts.clone()
-};
-```
-
-### Why it is required
-
-Not strictly blocking — you can parse prose — but every turn parsed out of free
-text is a turn that can fail in a new way, and a 300-move game will find all of
-them. `ToolChoice::Tool` plus a `pattern`-constrained schema turns move extraction
-from a parsing problem into a validation problem, and validation you were doing
-anyway (occupied / suicide / ko).
-
-`parallel_tool_calls: Some(false)` matters because the sensible tool set includes
-`update_notes` alongside `play_move`. Without it the model will sometimes emit both
-in one turn, and the loop has to decide whether the notes were written before or
-after a move that has not been validated yet. Forbidding it at the wire level is
-cheaper than ordering it after the fact.
 
 ---
 

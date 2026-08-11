@@ -371,7 +371,6 @@ fn report(game: &Game, agent: &Agent, opts: &Opts) {
         s.rejection_rate() * 100.0
     );
     println!("no-tool-call turns: {}", s.no_tool_call);
-    println!("parallel calls:     {} (expected 0)", s.parallel_calls_seen);
     println!("forced passes:      {}", s.forced_passes);
     println!("notes updates:      {}", s.notes_updates);
     println!("reasoning stripped: {}", s.reasoning_stripped);

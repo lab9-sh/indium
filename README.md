@@ -23,42 +23,17 @@ what came back) to `--out`, default `games/latest`.
 |---|---|
 | `messages_mut` / `push_message` / `from_parts` | works; the tail-state-block pattern is implementable |
 | `TextBlock::new` / `ToolResultBlock::new` | works |
-| `ToolChoice` | works on the wire, but see finding 1; indium hardcodes `Auto` |
 | `ThinkingEffort` | works; exposed as `--thinking high\|medium\|low` (default medium) |
-| `parallel_tool_calls: Some(false)` | works — 0 parallel calls observed in 32 API calls |
 | `cache_breakpoint_from_end` (added) | required; without it the pattern has *negative* cache value |
 
-Both features landed and both do what they say. A third was needed
-(`cache_breakpoint_from_end`, finding 2) and is now implemented. Five things
-surfaced that the proposal did not anticipate.
+The mutability surface does what it says. An explicit cache breakpoint
+(`cache_breakpoint_from_end`, finding 1) was also required and is now part of
+the hydrogen surface this POC needs. Several things surfaced that the proposal
+did not anticipate.
 
 ## Findings
 
-### 1. Forced tool choice silently disables reasoning
-
-The proposal's recipe sets `tool_choice: ToolChoice::Tool("play_move")` *and*
-`thinking: Some(ThinkingEffort::High)`. The API accepts that combination — no
-error — but the model then emits **only** the tool call:
-
-| request | content blocks returned | thinking tokens |
-|---|---|---|
-| `tool_choice: {type: tool, name: play_move}` | `[tool_use]` | 0 |
-| `tool_choice: {type: any}` | `[tool_use]` | 0 |
-| `tool_choice: {type: auto}` | `[thinking, text, tool_use]` | 35–70 |
-
-For Go, where move quality is the entire point, forcing the call trades away
-all reasoning to buy a guarantee you do not need: across 32 live API calls under
-`auto`, the model called `play_move` **every time** (0 no-tool-call turns). It
-also makes `update_notes` unreachable, since a pinned `tool_choice` can only
-ever select the one tool.
-
-Indium therefore hardcodes `ToolChoice::Auto` (the CLI flag was dropped once
-both providers proved reliable under auto: Anthropic 0/32 no-tool-call turns;
-xAI smoke games likewise always called `play_move`). Keep `ToolChoice` in
-hydrogen — it is correct and useful — but the game should not pin tools on move
-turns, and the proposal's example should not recommend it.
-
-### 2. Demotion destroys the prompt cache
+### 1. Demotion destroys the prompt cache
 
 This is the significant one, because the cost argument in the proposal rests on
 it: *"the edit is always at a fixed depth from the end, so the cached prefix
@@ -108,7 +83,7 @@ The uncached column is the one that matters, and it is now flat — which is the
 proposal's actual claim ("you reprocess ~1000 tokens per turn and hit cache on
 everything older"). It was true in principle and false in implementation.
 
-### 3. Context growth is dominated by assistant turns, not boards
+### 2. Context growth is dominated by assistant turns, not boards
 
 The proposal projects `system + 250×50 + 900` ≈ 12k for a full game. Measured
 over 15 model moves with reasoning on, growth was **427 tokens/move**, which
@@ -153,7 +128,7 @@ versus ~2567 with both. Keep the reasoning and let the cache absorb it; reach
 for `--keep-reasoning` only if raw context length, not cost, is the binding
 constraint.
 
-### 4. The proposal's example code orphans a tool result
+### 3. The proposal's example code orphans a tool result
 
 In `play_one_move`, the demotion step is:
 
@@ -172,7 +147,7 @@ Demotion has to preserve the block *kind* — a `tool_result` stays a
 That is `agent::demote_in_place`, and it is the thing
 `demotion_keeps_a_tool_result_a_tool_result_with_the_same_id` pins.
 
-### 5. In a tool loop, the model stops emitting text — and looks like it stopped thinking
+### 4. In a tool loop, the model stops emitting text — and looks like it stopped thinking
 
 Observed as "I only saw the model explain itself on its first move." Across a
 33-move game, exactly **1 of 33** turns produced any assistant prose.
@@ -185,7 +160,7 @@ only `ContentBlock::Text` therefore captures the first turn and nothing after,
 even though output ran 500–1700 tokens a turn.
 
 This is a direct consequence of the "fat block rides in a `tool_result`" choice
-in finding 2's design, and it is worth knowing before you conclude a model is
+in finding 1's design, and it is worth knowing before you conclude a model is
 being terse. Two things to read instead, both already available:
 
 - `ReasoningBlock::summary()` — hydrogen exposes it; it is populated on most turns.
@@ -195,7 +170,7 @@ being terse. Two things to read instead, both already available:
 The UI now prefers the tool argument, falls back to prose, then to the thinking
 summary. All three go to `prompts.log`.
 
-### 6. `Usage` dropped the cache fields (fixed in hydrogen)
+### 5. `Usage` dropped the cache fields (fixed in hydrogen)
 
 Anthropic returns `cache_creation_input_tokens` and `cache_read_input_tokens`;
 hydrogen parsed neither, so the consumer could not observe cache behavior — the

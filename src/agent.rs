@@ -14,8 +14,7 @@
 
 use hydrogen::types::{ContentBlock, Message, Role, TextBlock, ToolResultBlock, ToolUseBlock};
 use hydrogen::{
-    Client, Conversation, Error, RequestOptions, ThinkingEffort, ToolChoice, ToolDef, ToolOutput,
-    Usage,
+    Client, Conversation, Error, RequestOptions, ThinkingEffort, ToolDef, ToolOutput, Usage,
 };
 use serde_json::json;
 
@@ -49,7 +48,6 @@ pub struct Stats {
     pub turns: Vec<TurnStat>,
     pub rejections: usize,
     pub no_tool_call: usize,
-    pub parallel_calls_seen: usize,
     pub forced_passes: usize,
     pub notes_updates: usize,
     pub reasoning_stripped: usize,
@@ -124,13 +122,7 @@ impl Agent {
             model,
             system: Some(crate::prompt::SYSTEM_PROMPT.into()),
             tools: vec![play_move_tool(), update_notes_tool()],
-            // Auto keeps reasoning; forced/required suppress it (see README
-            // finding 1). Both providers call tools reliably under auto.
-            tool_choice: ToolChoice::Auto,
             thinking: Some(thinking),
-            // One move per turn: without this the model can emit play_move and
-            // update_notes together and the loop has to guess their order.
-            parallel_tool_calls: Some(false),
             max_tokens: Some(8192),
             // The tail message is rebuilt every turn, so the breakpoint has to
             // sit one back from it — on the last message that will not change.
@@ -241,68 +233,86 @@ impl Agent {
                     _ => {}
                 }
             }
-            if calls.len() > 1 {
-                self.stats.parallel_calls_seen += 1;
-            }
             self.conv.push_response(resp);
 
-            let Some(call) = calls.into_iter().next() else {
-                // Reachable under ToolChoice::Auto: the model answered in prose.
+            if calls.is_empty() {
+                // Model answered in prose instead of calling a tool.
                 self.stats.no_tool_call += 1;
                 self.conv
                     .push_user("Place a stone by calling the play_move tool. Do that now.");
                 continue;
-            };
+            }
 
-            match call.name.as_str() {
-                "update_notes" => {
-                    self.apply_notes(&call);
-                    self.stats.notes_updates += 1;
-                    self.conv
-                        .push_tool_result(&call.id, ToolOutput::Text("notes updated".into()));
-                }
-                "play_move" => match self.validate(game, &call) {
-                    Ok(mv) => {
-                        // Leave this call unanswered; next turn's fat block
-                        // becomes its tool_result.
-                        self.pending_tool_id = Some(call.id);
-                        self.pending_stub_for = Some(game.move_number());
-                        if self.collapse_retries {
-                            self.collapse(move_start);
+            // Handle every tool_use so none are left unanswered. Notes get an
+            // immediate result; a successful play_move is left pending so the
+            // next fat block can ride in its tool_result. Both in one response
+            // is fine: notes apply to local state, then the move is returned.
+            let mut accepted: Option<(Move, String)> = None;
+            for call in calls {
+                match call.name.as_str() {
+                    "update_notes" => {
+                        self.apply_notes(&call);
+                        self.stats.notes_updates += 1;
+                        self.conv
+                            .push_tool_result(&call.id, ToolOutput::Text("notes updated".into()));
+                    }
+                    "play_move" => {
+                        if self.pending_tool_id.is_some() {
+                            self.conv.push_tool_result(
+                                &call.id,
+                                ToolOutput::Error(
+                                    "already accepted a move this turn; call play_move once"
+                                        .into(),
+                                ),
+                            );
+                            continue;
                         }
-                        stat.messages = self.conv.messages().len();
-                        let attempts = stat.api_calls;
-                        self.stats.turns.push(stat);
-                        let rationale = call
-                            .input
-                            .get("reasoning")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        return Ok((
-                            TurnOutcome {
-                                mv,
-                                attempts,
-                                commentary,
-                                reasoning,
-                                rationale,
-                                forced_pass: false,
-                            },
-                            fat,
-                        ));
+                        match self.validate(game, &call) {
+                            Ok(mv) => {
+                                self.pending_tool_id = Some(call.id);
+                                self.pending_stub_for = Some(game.move_number());
+                                let rationale = call
+                                    .input
+                                    .get("reasoning")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                accepted = Some((mv, rationale));
+                            }
+                            Err(why) => {
+                                self.stats.rejections += 1;
+                                stat.rejections += 1;
+                                self.conv.push_tool_result(&call.id, ToolOutput::Error(why));
+                            }
+                        }
                     }
-                    Err(why) => {
-                        self.stats.rejections += 1;
-                        stat.rejections += 1;
-                        self.conv.push_tool_result(&call.id, ToolOutput::Error(why));
+                    other => {
+                        self.conv.push_tool_result(
+                            &call.id,
+                            ToolOutput::Error(format!("unknown tool '{other}'")),
+                        );
                     }
-                },
-                other => {
-                    self.conv.push_tool_result(
-                        &call.id,
-                        ToolOutput::Error(format!("unknown tool '{other}'")),
-                    );
                 }
+            }
+
+            if let Some((mv, rationale)) = accepted {
+                if self.collapse_retries {
+                    self.collapse(move_start);
+                }
+                stat.messages = self.conv.messages().len();
+                let attempts = stat.api_calls;
+                self.stats.turns.push(stat);
+                return Ok((
+                    TurnOutcome {
+                        mv,
+                        attempts,
+                        commentary,
+                        reasoning,
+                        rationale,
+                        forced_pass: false,
+                    },
+                    fat,
+                ));
             }
         }
 
@@ -355,13 +365,17 @@ impl Agent {
 
     /// Drop the assistant/tool_result pairs left behind by rejected attempts.
     ///
-    /// Each pair is self-contained, so removing them keeps the transcript
-    /// consistent — but it does discard those turns' thinking blocks, which is
-    /// why it is opt-in.
+    /// Keeps the last assistant turn and any tool results already pushed for
+    /// it (e.g. a sibling `update_notes` answered in the same response). Each
+    /// removed pair is self-contained, so the transcript stays consistent —
+    /// but discarded thinking blocks are why this is opt-in.
     fn collapse(&mut self, move_start: usize) {
-        let accepted = self.conv.messages().len() - 1;
-        if accepted > move_start {
-            self.conv.messages_mut().drain(move_start..accepted);
+        let msgs = self.conv.messages();
+        let Some(assistant_idx) = msgs.iter().rposition(|m| m.role == Role::Assistant) else {
+            return;
+        };
+        if assistant_idx > move_start {
+            self.conv.messages_mut().drain(move_start..assistant_idx);
         }
     }
 
