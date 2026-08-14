@@ -1,6 +1,6 @@
 # indium
 
-Human-vs-LLM Go on a 19x19 board, built on [hydrogen](../hydrogen). It exists to
+Human-vs-LLM Go on a 19x19 board, built on [hydrogen](https://github.com/lab9-sh/hydrogen). It exists to
 validate the agent-loop features in [PROPOSAL-agent-loops.md](PROPOSAL-agent-loops.md)
 under a real long-running environment loop, and it is a POC — the loop and the
 telemetry are the deliverable, not the playing strength.

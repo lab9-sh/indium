@@ -15,6 +15,6 @@ name = "indium"
 path = "src/main.rs"
 
 [dependencies]
-hydrogen = { path = "../hydrogen" }
+hydrogen = { git = "https://github.com/lab9-sh/hydrogen", tag = "v0.1.0" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
